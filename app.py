@@ -7,18 +7,34 @@ import os
 st.set_page_config(page_title="Mappatura Bilancio PRO", layout="wide")
 DEFAULT_SCHEMA_FILENAME = "schema_ftc.xlsx"
 
+# CSS PERSONALIZZATO PER RIDURRE IL FONT NELL'ALBERO
+st.markdown("""
+<style>
+    /* Riduce la dimensione del font nell'expander (i titoli dell'albero) */
+    .streamlit-expanderHeader {
+        font-size: 14px !important;
+        padding-top: 5px !important;
+        padding-bottom: 5px !important;
+    }
+    /* Riduce un po' il font delle tabelle per compattare */
+    div[data-testid="stDataFrame"] {
+        font-size: 13px !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 def load_schema_logic():
-    """Gestisce il caricamento dello schema FTC (Automatico o Manuale)"""
+    """Gestisce il caricamento dello schema FTC"""
     schema_df = None
     if os.path.exists(DEFAULT_SCHEMA_FILENAME):
         try:
             schema_df = pd.read_excel(DEFAULT_SCHEMA_FILENAME)
-            st.success(f"✅ Schema FTC caricato automaticamente da '{DEFAULT_SCHEMA_FILENAME}'")
+            st.success(f"✅ Schema FTC caricato automaticamente")
         except Exception as e:
             st.error(f"Errore lettura file default: {e}")
 
     if schema_df is None:
-        st.warning(f"File '{DEFAULT_SCHEMA_FILENAME}' non trovato. Caricalo manualmente qui sotto.")
+        st.warning(f"File '{DEFAULT_SCHEMA_FILENAME}' non trovato. Caricalo manualmente.")
         uploaded_schema = st.file_uploader("Carica Piano Conti FTC (Excel)", type=['xlsx'])
         if uploaded_schema:
             schema_df = pd.read_excel(uploaded_schema)
@@ -28,14 +44,14 @@ def load_schema_logic():
 def main():
     st.title("📊 Mappatura Bilancio Avanzata")
     
-    # --- FASE 1: SCHEMA FTC ---
+    # --- 1. CONFIGURAZIONE ---
     st.sidebar.header("1. Configurazione")
     df_schema = load_schema_logic()
     
     if df_schema is None:
         st.stop() 
 
-    # Preparazione Opzioni Schema (preservando ordine)
+    # Preparazione Opzioni Schema
     schema_opts = []
     sort_order_map = {} 
     counter = 0
@@ -48,16 +64,16 @@ def main():
         sort_order_map[full_label] = counter
         counter += 1
 
-    # --- FASE 2: INPUT DATI ---
+    # --- 2. INPUT DATI ---
     st.header("Caricamento Dati")
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("A. Nuova Situazione Contabile")
-        source_file = st.file_uploader("Carica Bilancio Verifica (Excel)", type=['xlsx'], key="src")
+        st.subheader("A. Situazione Contabile")
+        source_file = st.file_uploader("Carica Excel", type=['xlsx'], key="src")
         
     with col2:
-        st.subheader("B. Mappatura Salvata (Opzionale)")
+        st.subheader("B. Recupera Lavoro (Opzionale)")
         mapping_file = st.file_uploader("Carica file precedente", type=['xlsx'], key="map")
 
     if source_file:
@@ -66,72 +82,83 @@ def main():
             df_source = pd.read_excel(source_file)
             df_source.columns = df_source.columns.str.strip()
             
-            # --- LOGICA INTELLIGENTE PER COLONNE ---
+            # --- RICONOSCIMENTO COLONNE ---
             cols = df_source.columns
-            lower_cols = [c.lower() for c in cols]
-            
-            # 1. Trova Conto (cerca 'conto', esclude 'desc')
             c_conto = next((c for c in cols if 'conto' in c.lower() and 'des' not in c.lower()), cols[0])
-            
-            # 2. Trova Descrizione (cerca 'desc')
             c_desc = next((c for c in cols if 'desc' in c.lower()), cols[1])
             
-            # 3. Trova SALDO FINALE (Priorità: contiene 'fin' o 'chiusura', altrimenti ultimo saldo, altrimenti ultima colonna)
+            # Cerca il Saldo Finale
             saldo_candidates = [c for c in cols if 'saldo' in c.lower() or 'imp' in c.lower()]
-            
             c_saldo = None
-            # Cerca candidato con 'fin' (finale) o 'chiu' (chiusura)
             for cand in saldo_candidates:
                 if 'fin' in cand.lower() or 'chiu' in cand.lower():
                     c_saldo = cand
                     break
-            
-            # Se non trova 'finale', prende l'ultimo dei candidati saldo (spesso è quello finale)
-            if c_saldo is None and saldo_candidates:
-                c_saldo = saldo_candidates[-1]
-            
-            # Fallback assoluto: ultima colonna del file
-            if c_saldo is None:
-                c_saldo = cols[-1]
+            if c_saldo is None and saldo_candidates: c_saldo = saldo_candidates[-1]
+            if c_saldo is None: c_saldo = cols[-1]
 
-            st.caption(f"Colonne rilevate -> Conto: **{c_conto}** | Descrizione: **{c_desc}** | Saldo utilizzato: **{c_saldo}**")
+            # --- PULIZIA DATI ---
+            rows_before = len(df_source)
+            df_source[c_conto] = df_source[c_conto].astype(str).str.strip()
+            
+            # 1. Gestione Eccezioni (14 e 40)
+            target_14 = ['14/0000/0000', '14/00000000', '1400000000']
+            target_40 = ['40/0000/0000', '40/00000000', '4000000000']
+            df_source.loc[df_source[c_conto].isin(target_14), c_conto] = '14/0000/0001'
+            df_source.loc[df_source[c_conto].isin(target_40), c_conto] = '40/0000/0001'
+            
+            # 2. Rimozione Mastri/Sottomastri (che finiscono con 0000)
+            df_source = df_source[~df_source[c_conto].str.endswith('0000')]
+            
+            # 3. Rimozione righe vuote
+            df_source = df_source[df_source[c_conto] != 'nan']
+            df_source = df_source.dropna(subset=[c_saldo])
+            
+            # --- RIMOZIONE COLONNE INUTILI ---
+            cols_to_drop = [c for c in df_source.columns if any(x in c.lower() for x in ['dare', 'avere', 'apertura'])]
+            if c_saldo in cols_to_drop:
+                cols_to_drop.remove(c_saldo)
+            
+            if cols_to_drop:
+                df_source = df_source.drop(columns=cols_to_drop)
+                st.caption(f"Colonne nascoste: {', '.join(cols_to_drop)}")
 
-            # Inizializza colonna destinazione
+            st.divider()
+
+            # --- RECUPERO MAPPATURA ---
             if 'Destinazione_FTC' not in df_source.columns:
                 df_source['Destinazione_FTC'] = "DA ABBINARE"
 
-            # --- RECUPERO MAPPATURA ---
             if mapping_file:
                 try:
                     df_old = pd.read_excel(mapping_file)
                     old_cols = df_old.columns
-                    # Cerca la colonna conto nel vecchio file
-                    c_conto_old = next((c for c in old_cols if 'conto' in c.lower() and 'des' not in c.lower()), None)
+                    k_conto = next((c for c in old_cols if 'cod' in c.lower() and 'contab' in c.lower()), None)
+                    if not k_conto: k_conto = next((c for c in old_cols if 'conto' in c.lower()), None)
                     
                     mappa_dict = {}
-                    if c_conto_old:
-                        if 'Destinazione_FTC' in old_cols:
-                             mappa_dict = pd.Series(df_old['Destinazione_FTC'].values, index=df_old[c_conto_old].astype(str)).to_dict()
-                        elif 'Codice_Dest_FTC' in old_cols:
-                             df_old['Ricostruita'] = df_old['Codice_Dest_FTC'].astype(str) + " - " + df_old['Desc_Dest_FTC'].astype(str)
-                             mappa_dict = pd.Series(df_old['Ricostruita'].values, index=df_old[c_conto_old].astype(str)).to_dict()
+                    if k_conto:
+                        if 'Cod distinte' in old_cols and 'Descrizione distinte' in old_cols:
+                             df_old['Full_Dest'] = df_old['Cod distinte'].astype(str) + " - " + df_old['Descrizione distinte'].astype(str)
+                             mappa_dict = pd.Series(df_old['Full_Dest'].values, index=df_old[k_conto].astype(str)).to_dict()
+                        elif 'Destinazione_FTC' in old_cols:
+                             mappa_dict = pd.Series(df_old['Destinazione_FTC'].values, index=df_old[k_conto].astype(str)).to_dict()
                     
                     if mappa_dict:
                         def applica_mappa(riga):
-                            conto_str = str(riga[c_conto])
-                            val = mappa_dict.get(conto_str)
+                            c = str(riga[c_conto])
+                            val = mappa_dict.get(c)
                             if val and "nan - " not in str(val) and val != "DA ABBINARE":
                                 return val
                             return riga['Destinazione_FTC']
                         df_source['Destinazione_FTC'] = df_source.apply(applica_mappa, axis=1)
-                        st.success("✅ Mappatura precedente applicata!")
+                        st.success("✅ Mappatura recuperata!")
                 except Exception as ex:
-                    st.warning(f"Errore mappatura precedente: {ex}")
+                    st.warning(f"Info recupero: {ex}")
 
-            st.divider()
-
-            # --- LAYOUT PRINCIPALE ---
-            col_map, col_tree = st.columns([1.6, 1])
+            # --- LAYOUT PRINCIPALE MODIFICATO ---
+            # Prima era [1.6, 1], ora [1, 1] per dare più spazio all'albero
+            col_map, col_tree = st.columns([1, 1])
             
             with col_map:
                 st.subheader("Tabella di Lavoro")
@@ -155,11 +182,7 @@ def main():
 
             with col_tree:
                 st.subheader("Anteprima Albero FTC")
-                
-                # --- QUI LA MODIFICA: CONTENITORE SCORREVOLE ---
-                # height=600 mantiene la stessa altezza della tabella a sinistra
                 with st.container(height=600):
-                    
                     mapped_data = edited_df[edited_df['Destinazione_FTC'] != "DA ABBINARE"]
                     
                     if not mapped_data.empty:
@@ -173,46 +196,64 @@ def main():
                             sub = grp[c_saldo].sum()
                             tot_gen += sub
                             
-                            # Colore importo: Verde se > 0, Rosso se < 0
-                            color = "green" if sub >= 0 else "red"
+                            # --- TITOLO DINAMICO CON TOTALE ---
+                            # Il totale appare direttamente nella barra cliccabile
+                            label_con_totale = f"{dest}   ➡️   € {sub:,.2f}"
                             
-                            # Expander
-                            with st.expander(f"{dest}"):
-                                st.markdown(f"**Totale Voce: : {color}[€ {sub:,.2f}]**")
-                                st.dataframe(grp[[c_conto, c_desc, c_saldo]], hide_index=True)
+                            with st.expander(label_con_totale):
+                                # Qui dentro solo i conti, niente titolo grosso
+                                show_cols = [c_conto, c_desc, c_saldo]
+                                st.dataframe(
+                                    grp[show_cols], 
+                                    hide_index=True, 
+                                    use_container_width=True,
+                                    column_config={
+                                        c_saldo: st.column_config.NumberColumn("Importo", format="%.2f")
+                                    }
+                                )
                         
                         st.divider()
-                        st.metric("Totale Quadratura", f"€ {tot_gen:,.2f}")
+                        st.metric("TOTALE QUADRATURA", f"€ {tot_gen:,.2f}")
                     else:
-                        st.info("Nessun conto abbinato.")
+                        st.info("Inizia ad abbinare i conti per vedere l'albero.")
 
-            # --- EXPORT ---
+            # --- EXPORT STILE 'SAS' ---
             def split_mapping(val):
                 if val == "DA ABBINARE" or pd.isna(val): return "", ""
                 parts = str(val).split(' - ', 1)
                 return (parts[0], parts[1]) if len(parts) == 2 else (val, "")
 
             export_df = edited_df.copy()
-            export_df[['Codice_Dest_FTC', 'Desc_Dest_FTC']] = export_df['Destinazione_FTC'].apply(
+            export_df[['Cod_distinte', 'Desc_distinte']] = export_df['Destinazione_FTC'].apply(
                 lambda x: pd.Series(split_mapping(x))
             )
             
-            final_cols = [c_conto, c_desc, c_saldo, 'Destinazione_FTC', 'Codice_Dest_FTC', 'Desc_Dest_FTC']
-            remaining = [c for c in export_df.columns if c not in final_cols]
-            export_df = export_df[final_cols + remaining]
+            rename_map = {
+                c_conto: 'Cod contab',
+                c_desc: 'Descrizione',
+                'Cod_distinte': 'Cod distinte',
+                'Desc_distinte': 'Descrizione distinte'
+            }
+            export_df = export_df.rename(columns=rename_map)
+            
+            final_cols = ['Cod contab', 'Descrizione', 'Cod distinte', 'Descrizione distinte']
+            if c_saldo in export_df.columns:
+                final_cols.append(c_saldo)
+                
+            export_df = export_df[final_cols]
 
             st.divider()
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                export_df.to_excel(writer, index=False, sheet_name='Lavoro_Completo')
+                export_df.to_excel(writer, index=False, sheet_name='Foglio1')
                 if not mapped_data.empty:
                     summary = mapped_data.groupby('Destinazione_FTC')[c_saldo].sum().reset_index()
                     summary.to_excel(writer, index=False, sheet_name='Sintetico')
 
             st.download_button(
-                "💾 Salva File di Lavoro (Excel)",
+                "📥 Scarica Excel (Formato SAS)",
                 data=output.getvalue(),
-                file_name="Mappatura_FTC_Salvata.xlsx",
+                file_name="Export_SAS.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
